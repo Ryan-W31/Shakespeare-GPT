@@ -1,4 +1,5 @@
 # shakespeare-gpt.py -- Shakespeare-GPT -- Ryan-W31
+import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -72,53 +73,41 @@ def estimate_loss():
     return out
 print("\rInput Initialization: OK")
 
-print("Self-Attention Head Module: X", end="", flush=True)
-class Head(nn.Module):
-    # one Head of self attention
-
-    # initialize module
-    def __init__(self, head_size):
-        super().__init__()
-        self.key = nn.Linear(n_embed, head_size, bias=False)
-        self.query = nn.Linear(n_embed, head_size, bias=False)
-        self.value = nn.Linear(n_embed, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-        self.dropout = nn.Dropout(dropout)
-
-    # forward pass
-    def forward(self, x):
-        B, T, C = x.shape
-        k = self.key(x) # (B, T, C)
-        q = self.query(x) # (B, T, C)
-
-        # compute attention affinities
-        weights = q @ k.transpose(-2, -1) * C**-0.5 # (B, T, head_size) @ (B, head_size, T) ===> (B, T, T) 
-        weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
-        weights = F.softmax(weights, dim=-1) # (B, T, T)
-        weights = self.dropout(weights)
-
-        # get weighted aggregation of values
-        v = self.value(x) # (B, T, C)
-        out = weights @ v # (B, T, T) @ (B, T, C) ===> (B, T, C)
-        return out
-print("\rSelf-Attention Head Module: OK")
-
-print("MultiHeadAttention Module: X", end="", flush=True)
+print("CausalAttention Module: X", end="", flush=True)
 # multiple heads of self-attention in parallel
-class MultiHeadAttention(nn.Module):
+class CausalAttention(nn.Module):
     # initialize module
     def __init__(self, num_heads, head_size, n_embed):
         super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)]) # create a list of Head modules
+        assert n_embed % num_heads == 0
+        self.attn = nn.Linear(n_embed, 3 * n_embed, bias=False)
         self.proj = nn.Linear(n_embed, n_embed)
-        self.dropout = nn.Dropout(dropout)
+        self.attention_dropout = nn.Dropout(dropout)
+        self.residual_dropout = nn.Dropout(dropout)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size).view(1, 1, block_size, block_size)))
 
     # forward pass
     def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1) # concatenate results from all Head modules
-        out = self.dropout(self.proj(out))
+        B, T, C = x.size()
+
+        q, k, v = self.attn(x).split(n_embed, dim=2)
+
+        k = k.view(B, T, n_head, C // n_head).transpose(1, 2) # (B, T, C, H) where H is number of heads
+        q = q.view(B, T, n_head, C // n_head).transpose(1, 2) # (B, T, C, H) where H is number of heads
+        v = v.view(B, T, n_head, C // n_head).transpose(1, 2) # (B, T, C, H) where H is number of heads
+
+
+        attention = (q @ k.transpose(-2, -1)) * (1 / math.sqrt(k.size(-1))) 
+        attention = attention.masked_fill(self.tril[:, :, :T, :T] == 0, float('-inf')) # (B, T, T)
+        attention = F.softmax(attention, dim=-1) # (B, T, T)
+        attention = self.attention_dropout(attention)
+
+        out = attention @ v
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+
+        out = self.residual_dropout(self.proj(out))
         return out
-print("\rMultiHeadAttention Module: OK")
+print("\rCausalAttention Module: OK")
 
 print("FeedForward Module: X", end="", flush=True)
 # simple linear layer followed by non-linear activation function
@@ -144,7 +133,7 @@ class Block(nn.Module):
     def __init__(self, n_embed, n_head):
         super().__init__()
         head_size = n_embed // n_head
-        self.sa = MultiHeadAttention(n_head, head_size, n_embed)
+        self.sa = CausalAttention(n_head, head_size, n_embed)
         self.ffwd = FeedForward(n_embed)
         self.ln1 = nn.LayerNorm(n_embed) # layer norm
         self.ln2 = nn.LayerNorm(n_embed) # layer norm
@@ -218,9 +207,10 @@ print(f"\n{sum(p.numel() for p in m.parameters()) / 1e6 : .2f} M parameters\n")
 
 print("Iterations Starting now...")
 for i in range(max_iters):
-    if i % eval_interval == 0: # every 500 iterations record the mean loss
-        losses = estimate_loss()
-        print(f"Step {i:4d}: TRAIN loss {losses['train']:.4f} VAL loss {losses['val']:.4f}")
+    if i % 10 == 0: # every 500 iterations record the mean loss
+        print(f"\rIteration: {i:4d}")
+    #     losses = estimate_loss()
+    #     print(f"Step {i:4d}: TRAIN loss {losses['train']:.4f} VAL loss {losses['val']:.4f}")
 
     Xb, Yb = get_batch('train')
 
